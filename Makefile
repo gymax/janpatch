@@ -4,7 +4,7 @@ CC ?= gcc
 CFLAGS ?= -Wall
 
 MACROS += -DJANPATCH_STREAM=FILE
-CFLAGS += -I.
+CFLAGS += -I. -std=gnu99
 
 all: build
 
