@@ -1,5 +1,9 @@
 #include <stdio.h>
+#include <stdint.h>
+#include <unistd.h>
 #include "janpatch.h"
+
+#define MAX_FILEREAD_SIZE 524288
 
 int main(int argc, char **argv) {
     if (argc != 3 && argc != 4) {
@@ -7,10 +11,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Open streams
+    // To simulate non-POSIX put data into some buffers
     FILE *old = fopen(argv[1], "rb");
     FILE *patch = fopen(argv[2], "rb");
     FILE *target = argc == 4 ? fopen(argv[3], "wb") : stdout;
+    uint8_t *old_data = malloc(MAX_FILEREAD_SIZE * sizeof(char));
+    uint8_t *patch_data = malloc(MAX_FILEREAD_SIZE * sizeof(char));
+    uint8_t *target_data = malloc(MAX_FILEREAD_SIZE * sizeof(char));
 
     if (!old) {
         printf("Could not open '%s'\n", argv[1]);
@@ -25,17 +32,18 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    fread(old_data, 1, MAX_FILEREAD_SIZE, old);
+    fread(patch_data, 1, MAX_FILEREAD_SIZE, patch);
+
     // janpatch_ctx contains buffers, and references to the file system functions
     janpatch_ctx ctx = {
-        { (unsigned char*)malloc(1024), 1024 }, // source buffer
-        { (unsigned char*)malloc(1024), 1024 }, // patch buffer
-        { (unsigned char*)malloc(1024), 1024 }, // target buffer
-
-        &fread,
-        &fwrite,
-        &fseek,
-        &ftell
+        { (unsigned char*)malloc(4096), 4096 }, // source buffer
+        { (unsigned char*)malloc(4096), 4096 }, // patch buffer
+        { (unsigned char*)malloc(4096), 4096 }, // target buffer
     };
 
-    return janpatch(ctx, old, patch, target);
+
+    janpatch(ctx, old_data, patch_data, target_data);
+    fwrite(target_data, 1, MAX_FILEREAD_SIZE, target);
+    return 0;
 }

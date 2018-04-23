@@ -4,9 +4,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 #ifndef JANPATCH_DEBUG
-#define JANPATCH_DEBUG(...)  while (0) {} // printf(__VA_ARGS__)
+#define JANPATCH_DEBUG(...)  printf(__VA_ARGS__)
 #endif
 
 #ifndef JANPATCH_ERROR
@@ -14,12 +16,8 @@
 #endif
 
 // detect POSIX, and use FILE* in that case
-#if !defined(JANPATCH_STREAM) && (defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)))
-#include <stdio.h>
-#define JANPATCH_STREAM     FILE
-#elif !defined(JANPATCH_STREAM)
-#error "JANPATCH_STREAM not defined, and not on POSIX system. Please specify the JANPATCH_STREAM macro"
-#endif
+#define JANPATCH_STREAM     uint8_t
+
 
 typedef struct {
     unsigned char*   buffer;
@@ -35,18 +33,6 @@ typedef struct {
     janpatch_buffer source_buffer;
     janpatch_buffer patch_buffer;
     janpatch_buffer target_buffer;
-
-    // function signatures
-    size_t (*fread)(void*, size_t, size_t, JANPATCH_STREAM*);
-    size_t (*fwrite)(const void*, size_t, size_t, JANPATCH_STREAM*);
-    int    (*fseek)(JANPATCH_STREAM*, long int, int);
-    long   (*ftell)(JANPATCH_STREAM*);
-
-    // progress callback
-    void   (*progress)(uint8_t);
-
-    // the combination of the size of both the source + patch files (that's the max. the target file can be)
-    long   max_file_size;
 } janpatch_ctx;
 
 enum {
@@ -62,26 +48,22 @@ enum {
  * Read a buffer off the stream
  */
 static size_t jp_fread(janpatch_ctx *ctx, void *ptr, size_t size, size_t count, janpatch_buffer *buffer) {
-    ctx->fseek(buffer->stream, buffer->position, SEEK_SET);
+    memcpy(ptr, buffer->stream + buffer->position, size * count);
 
-    size_t bytes_read = ctx->fread(ptr, size, count, buffer->stream);
+    buffer->position += size * count;
 
-    buffer->position += bytes_read;
-
-    return bytes_read;
+    return size * count;
 }
 
 /**
  * Write a buffer to the stream
  */
-static size_t jp_fwrite(janpatch_ctx *ctx, const void *ptr, size_t size, size_t count, janpatch_buffer *buffer) {
-    ctx->fseek(buffer->stream, buffer->position, SEEK_SET);
+static size_t jp_fwrite(janpatch_ctx *ctx, void *ptr, size_t size, size_t count, janpatch_buffer *buffer) {
+    memcpy(buffer->stream + buffer->position, ptr, size * count);
 
-    size_t bytes_written = ctx->fwrite(ptr, size, count, buffer->stream);
+    buffer->position += size * count;
 
-    buffer->position += bytes_written;
-
-    return bytes_written;
+    return size * count;
 }
 
 /**
@@ -107,7 +89,10 @@ static int jp_fseek(janpatch_buffer *buffer, long int offset, int origin) {
  */
 static int jp_getc(janpatch_ctx* ctx, janpatch_buffer* buffer) {
     long position = buffer->position;
-    if (position < 0) return -1;
+    //printf("pos:%d\n", position);
+    if (position < 0) {
+        return -1;
+    }
 
     // calculate the current page...
     uint32_t page = ((unsigned long)position) / buffer->size;
@@ -146,10 +131,6 @@ static int jp_putc(int c, janpatch_ctx* ctx, janpatch_buffer* buffer) {
         if (buffer->current_page != -1) {
             jp_fseek(buffer, buffer->current_page * buffer->size, SEEK_SET);
             jp_fwrite(ctx, buffer->buffer, 1, buffer->current_page_size, buffer);
-
-            if (ctx->progress) {
-                ctx->progress(position * 100 / ctx->max_file_size);
-            }
         }
 
         // and read the next page...
@@ -187,9 +168,6 @@ static void jp_final_flush(janpatch_ctx* ctx, janpatch_buffer* buffer) {
     jp_fseek(buffer, buffer->current_page * buffer->size, SEEK_SET);
     jp_fwrite(ctx, buffer->buffer, 1, position_in_page, buffer);
 
-    if (ctx->progress) {
-        ctx->progress(100);
-    }
 }
 
 static void process_mod(janpatch_ctx *ctx, janpatch_buffer *source, janpatch_buffer *patch, janpatch_buffer *target, bool up_source_stream) {
@@ -217,7 +195,7 @@ static void process_mod(janpatch_ctx *ctx, janpatch_buffer *source, janpatch_buf
 
         // read the next character to see what we should do
         m = jp_getc(ctx, patch);
-        // JANPATCH_DEBUG("%02x ", m);
+        JANPATCH_DEBUG("%02x ", m);
 
         if (m == -1) {
             // End of file stream... rewind 1 character and return, this will yield back to janpatch main function, which will exit
@@ -293,23 +271,6 @@ int janpatch(janpatch_ctx ctx, JANPATCH_STREAM *source, JANPATCH_STREAM *patch, 
     ctx.patch_buffer.stream = patch;
     ctx.target_buffer.stream = target;
 
-    // look at the size of the source file...
-    if (ctx.progress != NULL && ctx.ftell != NULL) {
-        ctx.fseek(source, 0, SEEK_END);
-        ctx.max_file_size = ctx.ftell(source);
-        JANPATCH_DEBUG("Source file size is %ld\n", ctx.max_file_size);
-        ctx.fseek(source, 0, SEEK_SET);
-
-        // and at the size of the patch file
-        ctx.fseek(patch, 0, SEEK_END);
-        ctx.max_file_size += ctx.ftell(patch);
-        JANPATCH_DEBUG("Now max file size is %ld\n", ctx.max_file_size);
-        ctx.fseek(patch, 0, SEEK_SET);
-    }
-    else {
-        ctx.progress = NULL;
-    }
-
     int c;
     while ((c = jp_getc(&ctx, &ctx.patch_buffer)) != EOF) {
         if (c == JANPATCH_OPERATION_ESC) {
@@ -338,8 +299,6 @@ int janpatch(janpatch_ctx ctx, JANPATCH_STREAM *source, JANPATCH_STREAM *patch, 
                     break;
                 }
                 case JANPATCH_OPERATION_MOD: {
-                    JANPATCH_DEBUG("MOD: ");
-
                     // MOD means to modify the next series of bytes
                     // so just write everything (until the next ESC sequence) to the target JANPATCH_STREAM
                     // but also up the position in the source JANPATCH_STREAM every time
@@ -394,11 +353,11 @@ int janpatch(janpatch_ctx ctx, JANPATCH_STREAM *source, JANPATCH_STREAM *patch, 
                     return 1;
                 }
             }
-        }
-        else {
+        } else {
             JANPATCH_ERROR("Expected ESC but got %02x\n", c);
             JANPATCH_ERROR("Positions are, source=%ld patch=%ld new=%ld\n", ctx.source_buffer.position, ctx.patch_buffer.position, ctx.target_buffer.position);
 
+            jp_final_flush(&ctx, &ctx.target_buffer);
             return 1;
         }
     }
